@@ -1,0 +1,26 @@
+# Canonical CI for Sean's Python CLI tools — copy to
+# .github/workflows/ci.yml. NOTE: the GitHub App cannot create/edit files
+# under .github/workflows/ (no Workflows permission), so this file is
+# always added through the GitHub web UI.
+#
+# The suite is stdlib-only and fixture-based (no network), so CI is just:
+# byte-compile everything, then run the full unittest suite on both
+# Ubuntu and Windows.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall releasekit.py tests
+      - run: python -m unittest discover -s tests -v
