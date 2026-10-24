@@ -1,0 +1,6 @@
+[release]
+repo = "SeanShaffer88/FixtureKit"
+notes = "CHANGELOG"
+
+[version]
+source = "Cargo.toml"
