@@ -1,0 +1,26 @@
+# Example: a ProcessKit-style source-only DLL-kit release.
+# No binary assets — the release is the tagged source. Copy to your
+# project root as release.toml and adjust repo / version source.
+#
+# Flow: releasekit.py plan -> CI green -> releasekit.py prepare
+#       -> gh release create (command printed by prepare) -> releasekit.py verify
+
+[release]
+repo = "SeanShaffer88/ProcessKit"
+tag_prefix = "v"
+# Notes come from the CHANGELOG.md section for the version being released.
+# prepare FAILS if that section is missing — write the notes first.
+notes = "CHANGELOG"
+# Title pattern; {name}, {version}, {tag}, {repo} are substituted.
+# Default is "{name} {tag}".
+title = "{name} {tag}"
+
+[version]
+# Read the version from Cargo.toml's [package] version.
+source = "Cargo.toml"
+# A custom extractor, if the default doesn't fit:
+# regex = 'version\s*=\s*"([^"]+)"'
+# Other sources: "pyproject.toml", a plain "VERSION" file, or "git-tag".
+
+# No [[asset]] tables: source-only release. verify checks the release is
+# published (not a draft) and reports the tag target.
