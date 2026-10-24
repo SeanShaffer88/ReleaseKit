@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "releasekit"
+version = "0.1.0"
+description = "Prepare and verify GitHub releases from a release.toml: plan, prepare, and a verify gate that re-measures published assets against the manifest."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Sean Shaffer" }]
+dependencies = []
+
+[project.scripts]
+releasekit = "releasekit:main"
+
+[tool.setuptools]
+py-modules = ["releasekit"]
