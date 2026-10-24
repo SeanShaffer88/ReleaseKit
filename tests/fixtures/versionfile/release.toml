@@ -1,0 +1,5 @@
+[release]
+repo = "SeanShaffer88/VersionFixture"
+
+[version]
+source = "VERSION"
