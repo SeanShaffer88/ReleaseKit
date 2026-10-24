@@ -1,0 +1,33 @@
+# Example: a TrayClick-style app release — installer + portable exe.
+# Copy to your project root as release.toml and adjust names/commands.
+#
+# Flow: releasekit.py plan -> CI green -> releasekit.py prepare
+#       -> gh release create (command printed by prepare) -> releasekit.py verify
+#
+# verify compares the asset NAME SET, sizes, and API sha256 digests
+# against the prepared SHA256SUMS.txt — an asset rebuilt by CI after
+# prepare (or uploaded by hand) fails the gate by name.
+
+[release]
+repo = "SeanShaffer88/TrayClick"
+tag_prefix = "v"
+# Notes from a template file instead of the CHANGELOG (an example
+# template, release-notes-template.md, ships next to this file).
+notes = "docs/release-notes-template.md"
+title = "{name} {tag}"
+
+[version]
+source = "Cargo.toml"
+
+# The installer. {version} in name/path is substituted at prepare time.
+# build runs in the project directory at prepare time; the file at path
+# must exist afterwards (prepare fails loudly if it does not).
+[[asset]]
+name = "TrayClick-Setup-{version}-x64.exe"
+path = "target/release/TrayClick-Setup.exe"
+# build = "iscc installer\\TrayClick.iss"   # Inno Setup, uncomment on the build machine
+
+[[asset]]
+name = "TrayClick-{version}-portable.exe"
+path = "target/release/trayclick.exe"
+# build = "cargo build --release --locked"
