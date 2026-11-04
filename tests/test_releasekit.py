@@ -4,6 +4,9 @@ import json
 import sys
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -306,7 +309,8 @@ class TestPrepare(TempDirCase):
         out = self.root / "out"
         args = type("A", (), {"config": str(config), "version": None,
                               "out": str(out)})()
-        rc = rk.cmd_prepare(args)
+        with patch.object(rk, "run_quiet", return_value="a" * 40):
+            rc = rk.cmd_prepare(args)
         self.assertEqual(rc, 0)
         pack = json.loads((out / "release.json").read_text(encoding="utf-8"))
         self.assertEqual(pack["tag"], "v0.3.0")
@@ -318,11 +322,21 @@ class TestPrepare(TempDirCase):
                          hashlib.sha256(b"built-bytes").hexdigest())
         self.assertEqual(asset["size"], len(b"built-bytes"))
         self.assertIn("gh release create v0.3.0", pack["gh_command"])
+        self.assertIn("--target " + "a" * 40, pack["gh_command"])
         sums = rk.parse_sums((out / "SHA256SUMS.txt").read_text(encoding="utf-8"))
         self.assertEqual(sums[0]["sha256"], asset["sha256"])
         notes = (out / "notes.md").read_text(encoding="utf-8")
         self.assertIn("Demo release.", notes)
         self.assertTrue((out / "Demo-0.3.0.bin").is_file())
+
+    def test_prepare_requires_target(self):
+        config = self._project()
+        args = type("A", (), {"config": str(config), "version": None,
+                              "out": str(self.root / "out")})()
+        with patch.object(rk, "run_quiet", return_value=None):
+            with self.assertRaisesRegex(rk.RKError, "full commit"):
+                rk.cmd_prepare(args)
+        self.assertFalse((self.root / "out" / "release.json").exists())
 
     def test_prepare_missing_asset_fails_loudly(self):
         self.write("VERSION", "1.0.0\n")
@@ -348,10 +362,178 @@ class TestPrepare(TempDirCase):
                             'name = "x.bin"\npath = "nope.bin"\n')
         args = type("A", (), {"config": str(config), "version": None})()
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), patch.object(rk, "run_quiet", return_value=None), \
+                patch.object(rk, "fetch_json", return_value={"workflow_runs": []}):
             rc = rk.cmd_plan(args)
         self.assertEqual(rc, 1)
         self.assertIn("Not release-ready", buf.getvalue())
+
+
+class TestProvenance(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.release = load_fixture_json("api/app_release.json")
+        self.repo = "SeanShaffer88/FixtureKit"
+        self.tag = self.release["tag_name"]
+        self.pack = {"version": 1, "repo": self.repo, "tag": self.tag,
+                     "release_version": "1.2.3", "target": "a" * 40,
+                     "assets": [{"name": a["name"], "size": a["size"],
+                                 "sha256": a["digest"].split(":")[1]}
+                                for a in self.release["assets"]]}
+        self.release["url"] = f"{rk.API_BASE}/repos/{self.repo}/releases/{self.release['id']}"
+        self.release["html_url"] = f"https://github.com/{self.repo}/releases/tag/{self.tag}"
+        self.ref = {"ref": f"refs/tags/{self.tag}",
+                    "object": {"type": "commit", "sha": "a" * 40}}
+        self.args = type("A", (), {"repo": self.repo, "tag": self.tag,
+                                  "release_json": str(self.root / "release.json"),
+                                  "manifest": None})()
+
+    def verify(self, ref=None, annotated=None):
+        self.write("release.json", json.dumps(self.pack))
+        def fetch(url):
+            if "/git/ref/" in url:
+                return ref if ref is not None else self.ref
+            if "/git/tags/" in url:
+                return annotated
+            return self.release
+        with patch.object(rk, "fetch_json", side_effect=fetch) as api:
+            with patch.object(rk, "fetch_bytes", side_effect=never_download):
+                with redirect_stdout(io.StringIO()):
+                    result = rk.cmd_verify(self.args)
+        return result, api
+
+    def test_lightweight_matches(self):
+        self.assertEqual(self.verify()[0], 0)
+
+    def test_annotated_matches(self):
+        ref = copy.deepcopy(self.ref)
+        ref["object"] = {"type": "tag", "sha": "b" * 40}
+        annotated = {"sha": "b" * 40, "object": self.ref["object"]}
+        self.assertEqual(self.verify(ref, annotated)[0], 0)
+
+    def test_requested_identity_fails_before_fetch(self):
+        for key, value in (("repo", "Other/Repo"), ("tag", "wrong")):
+            with self.subTest(key=key):
+                with patch.object(self.args, key, value):
+                    self.write("release.json", json.dumps(self.pack))
+                    with patch.object(rk, "fetch_json", side_effect=AssertionError("network")) as api:
+                        with self.assertRaisesRegex(rk.RKError, "repository/tag"):
+                            rk.cmd_verify(self.args)
+                        api.assert_not_called()
+
+    def test_wrong_api_identity_with_identical_assets(self):
+        for key, value in (("tag_name", "wrong"),
+                           ("url", f"{rk.API_BASE}/repos/Other/Repo/releases/123"),
+                           ("repository", {"full_name": "Other/Repo"})):
+            original = copy.deepcopy(self.release)
+            with self.subTest(key=key):
+                self.release[key] = value
+                with self.assertRaisesRegex(rk.RKError, "differs"):
+                    self.verify()
+                self.release = original
+
+    def test_api_repository_identity_required_before_assets(self):
+        original = copy.deepcopy(self.release)
+        for url in (None, 123, "", original["url"] + "/assets",
+                    original["url"] + "?x=1", original["url"] + "0",
+                    f"{rk.API_BASE}/repos/Other/Repo/releases/{original['id']}"):
+            with self.subTest(url=url):
+                self.release = copy.deepcopy(original)
+                for field in ("url", "html_url", "repository"):
+                    self.release.pop(field, None)
+                if url is not None:
+                    self.release["url"] = url
+                with patch.object(rk, "compare_release") as compare:
+                    with self.assertRaises(rk.RKError) as error:
+                        self.verify()
+                    self.assertEqual(error.exception.code, 1)
+                    compare.assert_not_called()
+
+    def test_canonical_api_identity_without_html_url(self):
+        self.release.pop("html_url")
+        self.release["url"] = self.release["url"].replace(self.repo, self.repo.lower())
+        self.assertEqual(self.verify()[0], 0)
+
+    def test_canonical_optional_repository_identity_with_lowercase_request(self):
+        self.release["repository"] = {"full_name": self.repo}
+        self.args.repo = self.pack["repo"] = self.repo.lower()
+        self.assertEqual(self.verify()[0], 0)
+        for field, value in (("html_url", "https://github.com/Other/Repo/releases/tag/v1.2.3"),
+                             ("html_url", self.release["html_url"].replace("github.com", "github.com.evil")),
+                             ("html_url", self.release["html_url"].replace("https:", "http:")),
+                             ("html_url", self.release["html_url"].replace("/releases/", "/Releases/")),
+                             ("html_url", self.release["html_url"].replace("/releases/", "Extra/releases/")),
+                             ("repository", {"full_name": "Other/Repo"})):
+            original = self.release[field]
+            with self.subTest(field=field, value=value):
+                self.release[field] = value
+                with self.assertRaisesRegex(rk.RKError, "repository differs"):
+                    self.verify()
+                self.release[field] = original
+
+    def test_wrong_commit_despite_target_commitish(self):
+        self.release["target_commitish"] = self.pack["target"]
+        self.ref["object"]["sha"] = "c" * 40
+        with self.assertRaisesRegex(rk.RKError, "prepared target"):
+            self.verify()
+
+    def test_malformed_manifests(self):
+        original = copy.deepcopy(self.pack)
+        for key, value in (("target", None), ("target", "main"),
+                           ("version", True), ("repo", None), ("tag", ""),
+                           ("release_version", None), ("assets", [{}]),
+                           ("assets", None)):
+            with self.subTest(key=key, value=value):
+                self.pack = dict(original, **{key: value})
+                with self.assertRaisesRegex(rk.RKError, "invalid release.json"):
+                    self.verify()
+        for malformed in ([], None, "text"):
+            self.pack = malformed
+            with self.assertRaises(rk.RKError):
+                self.verify()
+
+    def test_tag_missing_malformed_cycle_and_depth(self):
+        for ref in ({}, {"ref": "refs/tags/wrong", "object": self.ref["object"]}):
+            with self.subTest(ref=ref), self.assertRaises(rk.RKError):
+                self.verify(ref)
+        for obj in (None, {}, {"type": "commit", "sha": "short"},
+                    {"type": "tree", "sha": "b" * 40}):
+            with self.subTest(obj=obj), self.assertRaises(rk.RKError):
+                self.verify(dict(self.ref, object=obj))
+        tag = {"type": "tag", "sha": "b" * 40}
+        for annotated in (None, {}, {"sha": "c" * 40, "object": self.ref["object"]}):
+            with self.subTest(annotated=annotated), self.assertRaises(rk.RKError):
+                self.verify(dict(self.ref, object=tag), annotated)
+        with self.assertRaisesRegex(rk.RKError, "cycle"):
+            self.verify(dict(self.ref, object=tag), {"sha": "b" * 40, "object": tag})
+        def deep_fetch(url):
+            if "/git/ref/" in url:
+                return dict(self.ref, object={"type": "tag", "sha": "0" * 40})
+            sha = url.rsplit("/", 1)[1]
+            return {"sha": sha, "object": {"type": "tag", "sha": f"{int(sha, 16)+1:040x}"}}
+        with self.assertRaisesRegex(rk.RKError, "depth limit"):
+            rk.resolve_tag_commit(self.repo, self.tag, deep_fetch)
+
+    def test_network_failure_is_clean_error(self):
+        self.write("release.json", json.dumps(self.pack))
+        def fail_tag(url):
+            if "/git/" in url:
+                raise rk.RKError("network fixture failure")
+            return self.release
+        with patch.object(rk, "fetch_json", side_effect=fail_tag):
+            with self.assertRaisesRegex(rk.RKError, "network fixture failure"):
+                rk.cmd_verify(self.args)
+
+    def test_checksum_mode_is_labelled_asset_only(self):
+        self.args.release_json = None
+        self.args.manifest = str(self.write(
+            "SHA256SUMS.txt", rk.build_sums(self.pack["assets"], self.repo, self.tag)))
+        buf = io.StringIO()
+        with patch.object(rk, "fetch_json", return_value=self.release) as api:
+            with redirect_stdout(buf):
+                self.assertEqual(rk.cmd_verify(self.args), 0)
+        self.assertIn("asset verification only", buf.getvalue())
+        self.assertFalse(any("/git/" in call.args[0] for call in api.call_args_list))
 
 
 if __name__ == "__main__":

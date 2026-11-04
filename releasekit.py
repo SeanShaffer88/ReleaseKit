@@ -33,6 +33,7 @@ import sys
 import tomllib
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 API_BASE = "https://api.github.com"
@@ -471,7 +472,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                          encoding="utf-8", newline="\n")
 
     head = run_quiet(["git", "rev-parse", "HEAD"], cwd=project_dir)
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head.strip()):
+        raise RKError("cannot prepare provenance: HEAD must resolve to a full commit ID")
     gh_parts = ["gh", "release", "create", tag, "--repo", cfg["repo"],
+                "--target", head.strip(),
                 "--title", title, "--notes-file", str(notes_path)]
     gh_parts += [a["path"] for a in collected]
     pack = {
@@ -608,14 +612,31 @@ def compare_release(release: dict, latest: dict | None,
     return problems, rows, infos
 
 
-def load_expected(args: argparse.Namespace) -> list[dict] | None:
+def load_expected(args: argparse.Namespace) -> dict | list[dict] | None:
     if args.release_json:
         try:
             pack = json.loads(Path(args.release_json).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RKError(f"cannot read release.json: {exc}")
-        return [{"name": a["name"], "sha256": a.get("sha256"),
-                 "size": a.get("size")} for a in pack.get("assets", [])]
+        if (not isinstance(pack, dict) or type(pack.get("version")) is not int
+                or pack["version"] != 1
+                or not isinstance(pack.get("repo"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", pack["repo"])
+                or any(not isinstance(pack.get(k), str) or not pack[k].strip()
+                       for k in ("tag", "release_version", "target"))
+                or not re.fullmatch(r"[0-9a-f]{40}", pack["target"])
+                or not isinstance(pack.get("assets"), list)):
+            raise RKError("invalid release.json: schema-1 identity and full target required")
+        names = set()
+        for a in pack["assets"]:
+            if (not isinstance(a, dict) or not isinstance(a.get("name"), str)
+                    or not a["name"] or a["name"] in names
+                    or type(a.get("size")) is not int or a["size"] < 0
+                    or not isinstance(a.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", a["sha256"])):
+                raise RKError("invalid release.json: malformed or duplicate asset")
+            names.add(a["name"])
+        return pack
     if args.manifest:
         try:
             text = Path(args.manifest).read_text(encoding="utf-8")
@@ -625,12 +646,62 @@ def load_expected(args: argparse.Namespace) -> list[dict] | None:
     return None
 
 
+def resolve_tag_commit(repo: str, tag: str, fetcher=None) -> str:
+    fetcher = fetcher or fetch_json
+    base = f"{API_BASE}/repos/{repo}"
+    ref = fetcher(f"{base}/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+    if not isinstance(ref, dict) or ref.get("ref") != f"refs/tags/{tag}":
+        raise RKError("remote tag reference does not match requested tag", code=1)
+    obj = ref.get("object")
+    seen = set()
+    for _ in range(16):
+        if (not isinstance(obj, dict) or not isinstance(obj.get("sha"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", obj["sha"])):
+            raise RKError("remote tag has missing or malformed target", code=1)
+        sha = obj["sha"]
+        if obj.get("type") == "commit":
+            return sha
+        if obj.get("type") != "tag" or sha in seen:
+            raise RKError("remote tag has unsupported target or cycle", code=1)
+        seen.add(sha)
+        annotated = fetcher(f"{base}/git/tags/{sha}")
+        if not isinstance(annotated, dict) or annotated.get("sha") != sha:
+            raise RKError("malformed annotated tag response", code=1)
+        obj = annotated.get("object")
+    raise RKError("remote tag exceeds annotated-tag depth limit", code=1)
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     repo = args.repo
     if "/" not in repo:
         raise RKError(f"--repo must look like \"Owner/Name\" (got {repo!r})")
     expected = load_expected(args)
-    release = fetch_json(f"{API_BASE}/repos/{repo}/releases/tags/{args.tag}")
+    pack = expected if isinstance(expected, dict) else None
+    if pack is not None:
+        if pack["repo"] != repo or pack["tag"] != args.tag:
+            raise RKError("requested repository/tag differs from release.json", code=1)
+        expected = pack["assets"]
+    release = fetch_json(f"{API_BASE}/repos/{repo}/releases/tags/"
+                         f"{urllib.parse.quote(args.tag, safe='')}")
+    if not isinstance(release, dict) or release.get("tag_name") != args.tag:
+        raise RKError("API release tag differs from requested tag", code=1)
+    release_url = release.get("url")
+    identity = (re.fullmatch(re.escape(f"{API_BASE}/repos/{repo}/releases/") + r"([0-9]+)",
+                             release_url, re.IGNORECASE)
+                if isinstance(release_url, str) else None)
+    if (identity is None or type(release.get("id")) is not int
+            or identity[1] != str(release["id"])):
+        raise RKError("API release repository identity missing, invalid, or differs from release id", code=1)
+    for field, prefix in (("html_url", rf"https://github\.com/(?i:{re.escape(repo)})/releases/"),):
+        if field in release and (not isinstance(release[field], str)
+                                 or not re.match(prefix, release[field])):
+            raise RKError("API release repository differs from requested repository", code=1)
+    if "repository" in release and (not isinstance(release["repository"], dict)
+                                   or not isinstance(release["repository"].get("full_name"), str)
+                                   or release["repository"]["full_name"].casefold() != repo.casefold()):
+        raise RKError("API release repository differs from requested repository", code=1)
+    if pack is not None and resolve_tag_commit(repo, args.tag) != pack["target"]:
+        raise RKError("remote tag commit differs from prepared target", code=1)
     try:
         latest = fetch_json(f"{API_BASE}/repos/{repo}/releases/latest")
     except RKError:
@@ -655,6 +726,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
             print(f"  - {p}")
         print("Do not call this release shipped until verify passes.")
         return 1
+    if pack is None:
+        print("info: asset verification only; prepared provenance was not verified")
     print(f"\nVERIFIED: {repo} {args.tag} matches "
           + ("the manifest." if expected is not None
              else "its API record (full re-measurement)."))
